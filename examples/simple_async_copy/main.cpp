@@ -12,6 +12,9 @@
 #include <windows.h>
 #endif
 
+#include <thread>
+#include <mutex>
+
 #include <boost/log/trivial.hpp>
 
 #include <scm/core.h>
@@ -31,7 +34,13 @@
 
 #include <GLFW/glfw3.h>
 
-GLFWwindow* window = nullptr;
+struct window_group {
+  GLFWwindow* window = nullptr;
+  GLFWwindow* offscreen_window = nullptr;
+};
+
+std::shared_ptr<window_group> windows = nullptr;
+std::mutex texture_write;
 
 static int const initial_window_width = 1920;
 static int const initial_window_height = 1080;
@@ -66,7 +75,11 @@ public:
 
   bool initialize();
   void initialize_framebuffer();
-  void display();
+
+  void render_to_texture();
+  void postprocess_frame();
+  void render_from_texture();
+
   void resize(int w, int h);
   void mouse_func(GLFWwindow* window, int button, int action, int mods);
   void mouse_motion_func(GLFWwindow* window, double xpos, double ypos);
@@ -87,7 +100,9 @@ private:
   float _dolly_sens;
 
   scm::shared_ptr<scm::gl::render_device>     _device;
-  scm::shared_ptr<scm::gl::render_context>    _context;
+
+  scm::shared_ptr<scm::gl::render_context>    _fast_context;
+  scm::shared_ptr<scm::gl::render_context>    _slow_context;
 
   scm::gl::program_ptr        _shader_program;
 
@@ -132,7 +147,7 @@ namespace {
 
 } // namespace
 
-
+///////////////////////////////////////////////////////////////////////////////
 demo_app::~demo_app()
 {
   _shader_program.reset();
@@ -158,12 +173,13 @@ demo_app::~demo_app()
   _color_buffer_resolved.reset();
   _framebuffer_resolved.reset();
 
-  _context.reset();
+  _fast_context.reset();
+  _slow_context.reset();
   _device.reset();
 }
 
-bool
-demo_app::initialize()
+///////////////////////////////////////////////////////////////////////////////
+bool demo_app::initialize()
 {
   using namespace scm;
   using namespace scm::gl;
@@ -180,7 +196,9 @@ demo_app::initialize()
   }
 
   _device.reset(new scm::gl::render_device());
-  _context = _device->main_context();
+
+  _fast_context = _device->main_context();
+  //_slow_context = _device->create_context();
 
   _shader_program = _device->create_program(list_of(_device->create_shader(STAGE_VERTEX_SHADER, vs_source))
     (_device->create_shader(STAGE_FRAGMENT_SHADER, fs_source)));
@@ -278,8 +296,9 @@ demo_app::initialize()
   return (true);
 }
 
-void 
-demo_app::initialize_framebuffer() {
+///////////////////////////////////////////////////////////////////////////////
+void demo_app::initialize_framebuffer() 
+{
   using namespace scm::gl;
   using namespace scm::math;
 
@@ -296,8 +315,8 @@ demo_app::initialize_framebuffer() {
 
 unsigned plah = 0;
 
-void
-demo_app::display()
+///////////////////////////////////////////////////////////////////////////////
+void demo_app::render_to_texture()
 {
   using namespace scm::gl;
   using namespace scm::math;
@@ -316,71 +335,76 @@ demo_app::display()
   _shader_program->uniform_sampler("color_texture_aniso", 0);
   _shader_program->uniform_sampler("color_texture_nearest", 1);
 
-  _context->clear_default_color_buffer(FRAMEBUFFER_BACK, vec4f(.2f, .2f, .2f, 1.0f));
-  _context->clear_default_depth_stencil_buffer();
+  _fast_context->clear_default_color_buffer(FRAMEBUFFER_BACK, vec4f(.2f, .2f, .2f, 1.0f));
+  _fast_context->clear_default_depth_stencil_buffer();
 
-  _context->reset();
+  _fast_context->reset();
 
   // multi sample pass
   { 
-    context_state_objects_guard csg(_context);
-    context_texture_units_guard tug(_context);
-    context_framebuffer_guard   fbg(_context);
+    context_state_objects_guard csg(_fast_context);
+    context_texture_units_guard tug(_fast_context);
+    context_framebuffer_guard   fbg(_fast_context);
 
-    _context->clear_default_color_buffer(FRAMEBUFFER_BACK, vec4f(.2f, .2f, .2f, 1.0f));
+    _fast_context->clear_default_color_buffer(FRAMEBUFFER_BACK, vec4f(.2f, .2f, .2f, 1.0f));
 
+    _fast_context->clear_color_buffer(_framebuffer, 0, vec4f(.2f, .2f, .2f, 1.0f));
+    _fast_context->clear_depth_stencil_buffer(_framebuffer, 1.0);
+    _fast_context->set_frame_buffer(_framebuffer);
 
-    _context->clear_color_buffer(_framebuffer, 0, vec4f(.2f, .2f, .2f, 1.0f));
-    _context->clear_depth_stencil_buffer(_framebuffer, 1.0);
-    _context->set_frame_buffer(_framebuffer);
+    _fast_context->set_viewport(viewport(vec2ui(0, 0), 1 * vec2ui(_window_width, _window_height)));
 
-    _context->set_viewport(viewport(vec2ui(0, 0), 1 * vec2ui(_window_width, _window_height)));
+    _fast_context->set_depth_stencil_state(_dstate_less);
+    _fast_context->set_blend_state(_no_blend);
+    _fast_context->set_rasterizer_state(_ms_back_cull);
 
-    _context->set_depth_stencil_state(_dstate_less);
-    _context->set_blend_state(_no_blend);
-    _context->set_rasterizer_state(_ms_back_cull);
+    _fast_context->bind_program(_shader_program);
 
-    _context->bind_program(_shader_program);
+    _fast_context->bind_texture(_color_texture, _filter_aniso, 0);
+    _fast_context->bind_texture(_color_texture, _filter_nearest, 1);
 
-    _context->bind_texture(_color_texture, _filter_aniso, 0);
-    _context->bind_texture(_color_texture, _filter_nearest, 1);
-
-    _obj->draw(_context);
-  }
-
-  // multisample texture to mipmap pyramid
-  {
-    _context->resolve_multi_sample_buffer(_framebuffer, _framebuffer_resolved);
-    _context->generate_mipmaps(_color_buffer_resolved);
-    _context->reset();
-  }
-
-  // fullscreen pass
-  {
-    mat4f   pass_mvp = mat4f::identity();
-    ortho_matrix(pass_mvp, 0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
-
-    const opengl::gl_core& glapi = _context->opengl_api();
-
-    _pass_through_shader->uniform_sampler("in_texture", 0);
-    _pass_through_shader->uniform("mvp", pass_mvp);
-
-    _context->set_default_frame_buffer();
-
-    _context->set_depth_stencil_state(_depth_no_z);
-    _context->set_blend_state(_no_blend);
-
-    _context->bind_program(_pass_through_shader);
-
-    _context->bind_texture(_color_buffer_resolved, _filter_nearest, 0);
-    _context->apply();
-    _quad->draw(_context);
+    _obj->draw(_fast_context);
   }
 
 }
 
-void
-demo_app::resize(int w, int h)
+///////////////////////////////////////////////////////////////////////////////
+void demo_app::postprocess_frame()
+{
+  // blit multisample texture to texture and generate mipmap pyramid
+  _fast_context->resolve_multi_sample_buffer(_framebuffer, _framebuffer_resolved);
+  _fast_context->generate_mipmaps(_color_buffer_resolved);
+  _fast_context->reset();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void demo_app::render_from_texture()
+{
+  using namespace scm::gl;
+  using namespace scm::math;
+
+  mat4f   pass_mvp = mat4f::identity();
+  ortho_matrix(pass_mvp, 0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+
+  const opengl::gl_core& glapi = _fast_context->opengl_api();
+
+  _pass_through_shader->uniform_sampler("in_texture", 0);
+  _pass_through_shader->uniform("mvp", pass_mvp);
+
+  _fast_context->set_default_frame_buffer();
+
+  _fast_context->set_depth_stencil_state(_depth_no_z);
+  _fast_context->set_blend_state(_no_blend);
+
+  _fast_context->bind_program(_pass_through_shader);
+
+  _fast_context->bind_texture(_color_buffer_resolved, _filter_nearest, 0);
+  _fast_context->apply();
+  _quad->draw(_fast_context);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void demo_app::resize(int w, int h)
 {
   // safe the new dimensions
   _window_width = w;
@@ -390,15 +414,15 @@ demo_app::resize(int w, int h)
   using namespace scm::gl; 
   using namespace scm::math;
 
-  _context->set_viewport(viewport(vec2ui(0, 0), vec2ui(w, h)));
+  _fast_context->set_viewport(viewport(vec2ui(0, 0), vec2ui(w, h)));
 
   scm::math::perspective_matrix(_projection_matrix, 60.f, float(w) / float(h), 0.1f, 1000.0f);
 
   initialize_framebuffer();
 }
 
-void
-demo_app::mouse_func(GLFWwindow* window, int button, int action, int mods)
+///////////////////////////////////////////////////////////////////////////////
+void demo_app::mouse_func(GLFWwindow* window, int button, int action, int mods)
 {
   switch (button) {
   case GLFW_MOUSE_BUTTON_LEFT:
@@ -422,8 +446,8 @@ demo_app::mouse_func(GLFWwindow* window, int button, int action, int mods)
   _inity = 2.f * float(_window_height - ypos - (_window_height / 2)) / float(_window_height);
 }
 
-void
-demo_app::mouse_motion_func(GLFWwindow* window, double xpos, double ypos)
+///////////////////////////////////////////////////////////////////////////////
+void demo_app::mouse_motion_func(GLFWwindow* window, double xpos, double ypos)
 {
   float nx = 2.f * float(xpos - (_window_width / 2)) / float(_window_width);
   float ny = 2.f * float(_window_height - ypos - (_window_height / 2)) / float(_window_height);
@@ -442,79 +466,164 @@ demo_app::mouse_motion_func(GLFWwindow* window, double xpos, double ypos)
   _initx = nx;
 }
 
-void
-demo_app::keyboard(unsigned char key, int x, int y)
-{
-}
+///////////////////////////////////////////////////////////////////////////////
+void demo_app::keyboard(unsigned char key, int x, int y)
+{}
 
+///////////////////////////////////////////////////////////////////////////////
 static void resize_callback(GLFWwindow* window, int w, int h)
 {
   if (_application)
     _application->resize(w, h);
 }
 
+///////////////////////////////////////////////////////////////////////////////
 static void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
   if (_application)
     _application->mouse_func(window, button, action, mods);
 }
+
+///////////////////////////////////////////////////////////////////////////////
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos)
 {
   if (_application)
     _application->mouse_motion_func(window, xpos, ypos);
 }
 
-
-int main(int argc, char **argv)
+///////////////////////////////////////////////////////////////////////////////
+void init_window(std::shared_ptr<window_group> const& wgroup)
 {
-  scm::shared_ptr<scm::core>      scm_core(new scm::core(argc, argv));
-  _application.reset(new demo_app());
-
-  /* Initialize the library */
-  if (!glfwInit())
-    return -1;
-
   /* Configure OpenGL context */
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 4);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
   /* Create a windowed mode window and its OpenGL context */
-  window = glfwCreateWindow(_application->window_width(), _application->window_height(), "Async Rendering Template", NULL, NULL);
+  auto win = glfwCreateWindow(_application->window_width(), _application->window_height(), "Async Rendering Window", NULL, NULL);
 
-  if (!window)
-  {
-    glfwTerminate();
-    return -1;
+  if (win) {
+    BOOST_LOG_TRIVIAL(info) << "Initialize fast client window succeed." << std::endl;
+  }
+  else {
+    BOOST_LOG_TRIVIAL(error) << "Initialize fast client window failed." << std::endl;
+  }
+  wgroup->window = win;
+
+  // Make the window's context current */
+  glfwMakeContextCurrent(wgroup->window);
+
+  // set callbacks
+  glfwSetMouseButtonCallback(wgroup->window, mouse_button_callback);
+  glfwSetCursorPosCallback(wgroup->window, cursor_position_callback);
+  glfwSetWindowSizeCallback(wgroup->window, resize_callback);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void init_offscreen_window(std::shared_ptr<window_group> const& wgroup)
+{
+  int  a = 0;
+  if (!wgroup->window) {
+    return;
   }
 
-  /* Make the window's context current */
-  glfwMakeContextCurrent(window);
+  Sleep(2000);
 
-  glfwSetMouseButtonCallback(window, mouse_button_callback);
-  glfwSetCursorPosCallback(window, cursor_position_callback);
-  glfwSetWindowSizeCallback(window, resize_callback);
+  // context creation configuration
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 4);
+  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+  glfwWindowHint(GLFW_VISIBLE, false);
+
+  // create window
+  glfwMakeContextCurrent(wgroup->window);
+  auto win = glfwCreateWindow(_application->window_width(), _application->window_height(), "Async Rendering Offscreen", NULL, wgroup->window);
+
+  if (win) {
+    BOOST_LOG_TRIVIAL(info) << "Initialize slow client window succeed." << std::endl;
+    wgroup->offscreen_window = win;
+  }
+  else {
+    BOOST_LOG_TRIVIAL(error) << "Initialize slow client window failed." << std::endl;
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void fast_client(std::shared_ptr<window_group> const& wgroup)
+{
+  if (!wgroup->window) {
+    init_window(wgroup);
+  }
+
 
   // init the GL context
   if (!_application->initialize()) {
-    std::cout << "error initializing gl context" << std::endl;
-    return (-1);
+    BOOST_LOG_TRIVIAL(error) << "error initializing gl context" << std::endl;
   }
 
+
+  // force resize
   _application->resize(initial_window_width, initial_window_height);
 
-  /* Loop until the user closes the window */
-  while (!glfwWindowShouldClose(window))
+
+  // render loop
+  while (!glfwWindowShouldClose(wgroup->window))
   {
-    /* Render here */
-    _application->display();
+    // Make the window's context current */
+    glfwMakeContextCurrent(wgroup->window);
 
-    /* Swap front and back buffers */
-    glfwSwapBuffers(window);
+    {
+      //BOOST_LOG_TRIVIAL(info) << "Fast Client : Render to texture." << std::endl;
+      _application->render_to_texture();
+      _application->postprocess_frame();
+      _application->render_from_texture();
+    }
 
-    /* Poll for and process events */
+    glfwSwapBuffers(wgroup->window);
     glfwPollEvents();
   }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+void slow_client(std::shared_ptr<window_group> const& wgroup)
+{
+  while (!wgroup->offscreen_window) {
+    init_offscreen_window(wgroup);
+  }
+
+  while (true) {
+    // std::lock_guard<std::mutex> lock(texture_write);
+    //BOOST_LOG_TRIVIAL(info) << "Slow Client : Render to texture." << std::endl;
+  }
+}
+
+void error_callback(int error, const char* description)
+{
+  BOOST_LOG_TRIVIAL(error) << " error code : " << int(error) << " description:" << description << std::endl;
+}
+
+
+///////////////////////////////////////////////////////////////////////////////
+int main(int argc, char **argv)
+{
+  /* Initialize the library */
+  if (!glfwInit()) {
+    BOOST_LOG_TRIVIAL(error) << "Failed to init GLFW" << std::endl;
+  }
+
+  glfwSetErrorCallback(error_callback);
+  
+  scm::shared_ptr<scm::core>      scm_core(new scm::core(argc, argv));
+  _application.reset(new demo_app());
+
+  windows = std::make_shared<window_group>();
+
+  std::thread fast_thread(std::bind(fast_client, std::ref(windows)));
+  std::thread slow_thread(std::bind(slow_client, std::ref(windows)));
+
+  fast_thread.join();
+  slow_thread.join();
 
   glfwTerminate();
 
