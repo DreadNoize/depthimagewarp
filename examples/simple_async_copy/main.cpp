@@ -511,7 +511,7 @@ void init_window(std::shared_ptr<window_group> const& wgroup)
   wgroup->window = win;
 
   // Make the window's context current */
-  glfwMakeContextCurrent(wgroup->window);
+  // glfwMakeContextCurrent(wgroup->window);
 
   // set callbacks
   glfwSetMouseButtonCallback(wgroup->window, mouse_button_callback);
@@ -526,8 +526,6 @@ void init_offscreen_window(std::shared_ptr<window_group> const& wgroup)
   if (!wgroup->window) {
     return;
   }
-
-  Sleep(2000);
 
   // context creation configuration
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
@@ -558,6 +556,7 @@ void fast_client(std::shared_ptr<window_group> const& wgroup)
 
 
   // init the GL context
+  glfwMakeContextCurrent(wgroup->window);
   if (!_application->initialize()) {
     BOOST_LOG_TRIVIAL(error) << "error initializing gl context" << std::endl;
   }
@@ -608,16 +607,22 @@ void error_callback(int error, const char* description)
 int main(int argc, char **argv)
 {
   /* Initialize the library */
+  scm::shared_ptr<scm::core>      scm_core(new scm::core(argc, argv));
+
   if (!glfwInit()) {
     BOOST_LOG_TRIVIAL(error) << "Failed to init GLFW" << std::endl;
   }
 
   glfwSetErrorCallback(error_callback);
   
-  scm::shared_ptr<scm::core>      scm_core(new scm::core(argc, argv));
   _application.reset(new demo_app());
 
   windows = std::make_shared<window_group>();
+
+  /*init_window(windows);
+  init_offscreen_window(windows);*/
+
+  //glfwMakeContextCurrent(windows->window);
 
   std::thread fast_thread(std::bind(fast_client, std::ref(windows)));
   std::thread slow_thread(std::bind(slow_client, std::ref(windows)));
